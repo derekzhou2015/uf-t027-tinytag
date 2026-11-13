@@ -1135,9 +1135,7 @@ class _ID3(TinyTag):
             return size
         parsed_size = self._ID3V2_HEADER_SIZE
         if extended:  # just read over the extended header.
-            extd_size = self._unsynchsafe(fh.read(6))
-            parsed_size += extd_size
-            fh.seek(extd_size - 6, SEEK_CUR)  # jump over extended_header
+            parsed_size += self._parse_id3v2_extended_header(fh, major)
         while parsed_size < size:
             frame_size = self._parse_frame(fh, size, id3version=major)
             if frame_size == -1:
@@ -1145,6 +1143,27 @@ class _ID3(TinyTag):
             parsed_size += frame_size
         self._set_grouping_work_fields()
         return size
+
+    def _parse_id3v2_extended_header(self,
+                                     fh: BinaryIO,
+                                     major: int) -> int:
+        # Skip the extended header and return its total size in bytes. The
+        # ID3v2.3 and ID3v2.4 specifications define the size field
+        # differently (section 3.2):
+        # - v2.3: plain 32-bit integer, excluding the 4 size bytes
+        # - v2.4: synchsafe integer, including the 4 size bytes
+        if major == 3:
+            raw_size = fh.read(4)
+            if len(raw_size) != 4:
+                return len(raw_size)
+            extended_size = int(unpack('>I', raw_size)[0]) + 4
+            fh.seek(extended_size - 4, SEEK_CUR)
+            return extended_size
+        # Other versions are handled as before: the synchsafe size field is
+        # read together with the following two bytes of the extended header.
+        extended_size = self._unsynchsafe(fh.read(6))
+        fh.seek(max(extended_size - 6, 0), SEEK_CUR)
+        return extended_size
 
     def _parse_id3v1(self, fh: BinaryIO) -> bool:
         content = fh.read(128 if self._parse_tags else 3)

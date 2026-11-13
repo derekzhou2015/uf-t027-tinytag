@@ -3242,6 +3242,40 @@ IMAGE_TEST_FILES: dict[str, ExpectedImages] = dict([
 SAMPLE_FOLDER = os.path.join(os.path.dirname(__file__), 'samples')
 
 
+def _synchsafe(value: int) -> bytes:
+    return bytes((
+        (value >> 21) & 0x7F,
+        (value >> 14) & 0x7F,
+        (value >> 7) & 0x7F,
+        value & 0x7F,
+    ))
+
+
+def _create_id3v2_tag(
+    major: int,
+    frames: list[tuple[bytes, bytes]],
+    extended_header_payload: bytes | None = None
+) -> bytes:
+    body = b''
+    if extended_header_payload is not None:
+        if major == 3:
+            # ID3v2.3: plain size, excluding the size field itself
+            body += len(extended_header_payload).to_bytes(4, 'big')
+        else:
+            # ID3v2.4: synchsafe size, including the size field itself
+            body += _synchsafe(len(extended_header_payload) + 4)
+        body += extended_header_payload
+    for frame_id, content in frames:
+        if major == 3:
+            size = len(content).to_bytes(4, 'big')
+        else:
+            size = _synchsafe(len(content))
+        body += frame_id + size + b'\x00\x00' + content
+    flags = 0x40 if extended_header_payload is not None else 0x00
+    header = b'ID3' + bytes((major, 0x00, flags)) + _synchsafe(len(body))
+    return header + body
+
+
 class TestAll(TestCase):
 
     @classmethod
@@ -3431,6 +3465,94 @@ class TestAll(TestCase):
         tag = TinyTag.get(chinese_id3, encoding='gbk')
         self.assertEqual(tag.artist, '苏云')
         self.assertEqual(tag.album, '角落之歌')
+
+    def test_id3v2_extended_header(self) -> None:
+        expected: dict[str, str | int] = {
+            'title': 'some title',
+            'artist': 'some artist',
+            'album': 'some album',
+            'track': 12,
+            'year': '1999',
+            'genre': 'Rock',
+            'comment': 'some comment',
+            'albumartist': 'album artist',
+            'composer': 'composer',
+        }
+        v23_frames = [
+            (b'TIT2', b'\x00some title'),
+            (b'TPE1', b'\x00some artist'),
+            (b'TALB', b'\x00some album'),
+            (b'TRCK', b'\x0012'),
+            (b'TYER', b'\x001999'),
+            (b'TCON', b'\x00Rock'),
+            (b'COMM', b'\x00eng\x00some comment'),
+            (b'TPE2', b'\x00album artist'),
+            (b'TCOM', b'\x00composer'),
+        ]
+        v24_frames = [
+            (b'TDRC' if frame_id == b'TYER' else frame_id, content)
+            for frame_id, content in v23_frames
+        ]
+        # Extended header payload sizes for which a plain 32-bit integer and
+        # a synchsafe integer decode to different values.
+        # v2.3: size field is plain and excludes itself.
+        v23_small = b'\x00' * 6
+        # v2.4: size field is synchsafe and includes itself.
+        v24_small = b'\x00' * 2
+        # A 300-byte payload catches off-by-size bugs that small ones hide:
+        # the v2.3 size field reads 300 (0x0000012C), the v2.4 one 304
+        # (synchsafe 0x00000230). Mixing up the two semantics skips the
+        # wrong number of bytes and no longer lands on the first frame.
+        v23_large = b'\x00' * 300
+        v24_large = b'\x00' * 300
+        for major, frames, small, large in (
+                (3, v23_frames, v23_small, v23_large),
+                (4, v24_frames, v24_small, v24_large)):
+            # Baseline: the same frames without an extended header
+            tag = TinyTag.get(
+                file_obj=BytesIO(_create_id3v2_tag(major, frames)),
+                tags=True, duration=False)
+            self._assert_id3_fields(
+                tag, expected, major, extended=False)
+            for extended in (small, large):
+                data = _create_id3v2_tag(major, frames, extended)
+                tag = TinyTag.get(
+                    file_obj=BytesIO(data), tags=True, duration=False)
+                self._assert_id3_fields(
+                    tag, expected, major, extended=True)
+
+    def _assert_id3_fields(self,
+                           tag: TinyTag,
+                           expected: dict[str, str | int],
+                           major: int,
+                           extended: bool) -> None:
+        with self.subTest(major=major, extended=extended):
+            for key, value in expected.items():
+                self.assertEqual(getattr(tag, key), value, key)
+
+    # pylint: disable=protected-access
+    def test_id3v2_extended_header_skip_semantics(self) -> None:
+        tag = _ID3()
+        # ID3v2.3: size field is plain and excludes itself, so a size of 6
+        # means 6 more bytes after the field.
+        fh = BytesIO(b'\x00\x00\x00\x06' + b'\x00' * 6 + b'rest')
+        self.assertEqual(tag._parse_id3v2_extended_header(fh, 3), 10)
+        self.assertEqual(fh.tell(), 10)
+        # ID3v2.4: size field is synchsafe and includes itself, so a size of
+        # 6 covers the whole extended header.
+        fh = BytesIO(b'\x00\x00\x00\x06' + b'\x00' * 2 + b'rest')
+        self.assertEqual(tag._parse_id3v2_extended_header(fh, 4), 6)
+        self.assertEqual(fh.tell(), 6)
+
+    def test_id3v2_3_extended_header_with_crc(self) -> None:
+        # An extended header with only the CRC flag set has a 10-byte
+        # payload; the stored size field is 10 (excluding itself)
+        frames = [(b'TIT2', b'\x00title after crc')]
+        extended = b'\x80\x00' + b'\x00' * 8
+        data = _create_id3v2_tag(3, frames, extended)
+        tag = TinyTag.get(
+            file_obj=BytesIO(data), tags=True, duration=False)
+        self.assertEqual(tag.title, 'title after crc')
 
     def test_invalid_file(self) -> None:
         for path, cls in (
